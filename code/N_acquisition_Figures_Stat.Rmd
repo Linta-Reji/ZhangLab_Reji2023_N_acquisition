@@ -1,0 +1,801 @@
+---
+title: "N_acquisition_Reji2023_figures_stat"
+author: "Linta Reji"
+date: "2023-08-01"
+output: html_document
+---
+
+Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(RColorBrewer)
+library(ggthemes)
+library(rstatix)
+library(phyloseq)
+library(microViz)
+library(ggpubr)
+library(pheatmap)
+library(vegan)
+library(lme4)
+library(effects)
+library(boot)
+```
+
+
+# load RData
+```{r}
+load("Nacq_MS_data.RData")
+```
+
+
+# Part 1: analyzing the 6 selected clades
+## Generates Figure 3a
+
+Load data file:
+```{r, message=FALSE, warning=FALSE}
+setwd("/Users/lintareji/Documents/ZhangLab-allProjects_Data-042921/N-acquisition/ZhangLab_Diaz_N_acquisition_2022/data/")
+dat.select = as.tibble(read.delim("FuncGenes_Results_summary_4plotting.txt", header=TRUE, na.strings = "NA", sep="\t"))
+```
+
+Inspect the data file, combine multi-gene variables into single pathway variables:
+```{r}
+colnames(dat.select)
+# need to combine nifHDK into nif; nirB, nirD into NO2assim-NADH; nirA as NO2assim-Fd
+# this reduces total number of columns to 14
+# mutate new columns: nif and nirBD
+dat.select = dat.select %>% 
+  mutate(nif = case_when(nifD>0 & nifK>0 & NifH>0 ~ 1,TRUE ~ 0)) %>%
+  mutate(nirBD = case_when(nirB>0 & nirD>0 ~ 1,TRUE ~ 0))
+# create a new tibble (delete individual nif and nir columns):
+dat.sel.ed = dat.select %>% select(-c(NifH, nifD, nifK, nirB, nirD))
+
+# NasA+nirA or NasA+NirBD as NO3assim
+dat.sel.ed = dat.sel.ed %>% mutate(no3assim = case_when(nasA>0 & nirA>0 ~ 1,
+                                    nasA>0 & nirBD>0 ~ 1,
+                                    TRUE ~ 0))
+# remove nasA column
+dat.sel.ed = dat.sel.ed %>% select(-c(nasA))
+
+# more descriptive column names
+colnames(dat.sel.ed) = c("Genome", "Domain", "Group", "Genus", "Species", "CDS", "NO2assim_fd", "Urea", "Cyanate", "Ammonium", "amtB_copies", "Chitinase", "Chitinase2", "BNF", "NO2assim_NADH", "NO3assim")
+
+# filter out NA rows
+dat.sel.ed[!complete.cases(dat.sel.ed), 1]
+dat.sel.ed = dat.sel.ed %>% drop_na()
+dim(dat.sel.ed) # 995 x 16
+```
+
+
+Plot CDS vs pathway counts
+### Figure 3a
+```{r}
+# new column with total number of pathways:
+dat.sel.ed = dat.sel.ed %>%
+  mutate(pathwaycount = rowSums(across(c("NO2assim_fd", "Urea", "Cyanate", "Ammonium", "Chitinase", "Chitinase2", "BNF", "NO2assim_NADH", "NO3assim"))))
+
+# plot CDS vs. total number of pathways
+dat.sel.ed$Group = factor(dat.sel.ed$Group, levels=c("Methanococcales", "Methanobacterales", "Desulfovibrionales", "Clostridium", "Rhizobiales", "Cyanobacteria", "Pseudomonadales"))
+
+fig.1a = ggplot(dat.sel.ed, aes(x=CDS, y=pathwaycount, fill=Group)) +
+  scale_fill_manual(values=c("#CD8862", "#D3CDBF", "#A092B7","#DD3C51","#1F6683", "#A1B654")) +
+  geom_point(shape=21, size=2, alpha = 0.65) +
+  geom_violin() +
+  xlab("Number of coding sequences") +
+  ylab("Number of pathways") +
+  theme_few() +
+  theme(axis.title = element_text(color="black"))
+
+fig.1a
+```
+
+
+# Part II: GEMs dataset
+
+--- Reading in and processing data
+
+Load the GEMs data file
+```{r}
+setwd("/Users/lintareji/Documents/ZhangLab-allProjects_Data-042921/N-acquisition/ZhangLab_Diaz_N_acquisition_2022/data/GEMs_hits")
+gem.dat = read.table("gems_hq_merged_wAAs.txt", header=TRUE, sep="\t")
+```
+
+Add a 'CDS' colum to gem.dat:
+```{r}
+# read in CDS data
+gem.cds = read.table("GEMs_HQ_CDS.tsv", sep="\t", header = FALSE)
+# change colnames
+colnames(gem.cds) = c("genome_id", "cds")
+# add cds counts to the df
+gem.dat = gem.dat %>%
+  left_join(y=gem.cds, by=c("genome_id"))
+```
+
+
+Extract phylogeny, split to columns:
+```{r}
+# full taxonomy stored in the column 'ecosystem'
+head(gem.dat$ecosystem)
+# split taxnomic ranks
+taxa.names = strsplit(gem.dat$ecosystem, ";")
+
+gem.dat$Domain = sapply(taxa.names, "[", 1)
+gem.dat$Phylum = sapply(taxa.names, "[", 2)
+gem.dat$Class = sapply(taxa.names, "[", 3)
+gem.dat$Order = sapply(taxa.names, "[", 4)
+gem.dat$Family = sapply(taxa.names, "[", 5)
+gem.dat$Genus = sapply(taxa.names, "[", 6)
+gem.dat$Species = sapply(taxa.names, "[", 7)
+# rm the expanded taxonomy column
+gem.dat = gem.dat %>% select(-ecosystem)
+```
+
+Count number of genomes, remove those without domain annotation
+```{r}
+gem.dat %>% count(Domain)
+# drop the one genome with Domain annotation "NULL"
+gem.dat = gem.dat %>% filter(Domain %in% c("d__Archaea", "d__Bacteria"))
+dim(gem.dat) #9142 genomes
+```
+
+--- Gene/pathway consolidation
+
+Combine genes, pathway counts
+```{r}
+colnames(gem.dat)
+# mutate new columns: 
+# nif and nirBD
+gem.dat = gem.dat %>% 
+  mutate(nif = case_when(nifD>0 & nifK>0 & nifH>0 ~ 1,TRUE ~ 0)) %>%
+  mutate(nirBD = case_when(nirB>0 & nirD>0 ~ 1,TRUE ~ 0))
+
+# delete individual nif and nir columns:
+gem.dat = gem.dat %>% select(-c(nifH, nifD, nifK, nirB, nirD))
+
+# NasA+nirA or NasA+NirBD as NO3assim_full
+gem.dat = gem.dat %>% 
+  mutate(no3assim_compl = case_when(nasA>0 & nirA>0 ~ 1,
+                                   nasA>0 & nirBD>0 ~ 1,
+                                   TRUE ~ 0))
+# AAs
+gem.dat = gem.dat %>%
+  mutate(aa = case_when(apc>0 | agcs>0 | bcct>0 | haaap>0 | livcs>0 ~ 1,TRUE ~ 0))
+
+# most gene counts are are currently actual copy counts. change this to presence/absence
+gem.dat = gem.dat %>% mutate(
+  "Ammonium" = case_when(amtB>0 ~1, TRUE ~0),
+  "NO2assim_fd" = case_when(nirA>0 ~1, TRUE ~0),
+  "Urea" = case_when(ureC>0 ~1, TRUE ~0),
+  "Cyanate" = case_when(cynS>0 ~1, TRUE ~0),
+  "Chitinase" = case_when(chitinase>0 ~1, TRUE ~0),
+  "Chitinase2" = case_when(hexosaminidiase>0 ~1, TRUE ~0),
+  "BNF" = case_when(nif>0 ~1, TRUE ~0),
+  "NO2assim_NADH" = case_when(nirBD>0 ~1, TRUE ~0),
+  "NO3assim" = case_when(nasA>0 ~1, TRUE ~0),
+  "NO3assim_compl" = case_when(no3assim_compl>0 ~1, TRUE ~0),
+  "AminoAcids" = case_when(aa>0 ~1, TRUE ~0)
+  )
+
+# filter out NA rows
+gem.dat = gem.dat %>% drop_na()
+
+# add column counting total number of pathways in each genome
+gem.dat = gem.dat %>%
+  mutate(N_pathways = rowSums(across(c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids))))
+
+```
+
+--- add a host non-host column
+```{r}
+gem.dat = gem.dat %>% 
+  mutate(Host = ifelse(ecosystem_category %in% c("Algae", "Animal", "Annelida", "Arthropoda", "Birds", "Cnidaria", "Fish", "Fungi", "Human", "Insecta", "Invertebrates", "Mammals", "Microbial", "Mollusca", "Plants", "Porifera", "Tunicates"), "host-associated", "free-living"))
+```
+
+
+*Work with genomes > 0 total pathway*
+
+--- Taxonomic distributions; total pathways vs. genome counts
+Subset genomes with at least 1 pathway
+```{r}
+gem.dat.nozero = gem.dat %>%
+  filter(N_pathways > 0)
+
+# genome counts by domain
+gem.dat.nozero %>% group_by(Domain) %>% count(n())
+```
+
+--- Total number of pathways vs. genome size
+genome length vs pathways
+
+### Figure S2
+```{r}
+# number of pathways vs genome length
+# fill by completeness
+ggplot(gem.dat.nozero, aes(x=genome_length, y=N_pathways)) +
+  geom_point() +
+  stat_smooth(method="lm", formula = y ~ 0 + x) +
+  theme_few()
+
+gen.len.fit = lm(N_pathways ~ 0 + log(genome_length), data=gem.dat.nozero)
+```
+
+--- Fix taxonomic annotations
+Fill in missing tax annotations based on the closest known level.
+
+```{r}
+# extract tax data
+gem.dat.nozero.tax = gem.dat.nozero %>%
+  select(Domain, Phylum, Class, Order, Family, Genus, Species) %>%
+  tax_table(.)
+colnames(gem.dat.nozero.tax) = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# fix tax annotations
+gem.dat.nozero.tax.fix = as.data.frame(tax_fix(gem.dat.nozero.tax, suffix_rank = "current"))
+gem.dat.nozero.tax.fix$genome_id = gem.dat.nozero$genome_id
+
+# remove non-taxonomy data from the original df
+gem.dat.nozero.fixed = gem.dat.nozero %>%
+  select(-c(Domain, Phylum, Class, Order, Family, Genus, Species))
+
+# final dataframe with taxonomic annotations fixed
+gem.dat.nozero.fixed = left_join(gem.dat.nozero.fixed, gem.dat.nozero.tax.fix, by = "genome_id")  
+```
+
+--- Pathway prevlences: Figures 1a, 1b, S1
+
+### overall prevalence, bootstrapped
+
+### Figure 1a
+```{r}
+# function for boostrapping the data, returning a vecotr of genom_counts for each pathway
+pathway_func = function(data, ind) {
+  data.ind = data[ind,]
+  counts.df = data.ind %>%
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>%
+  group_by(pathway) %>%
+  summarize(genome_counts = sum(counts))
+  return(as.vector(counts.df$genome_counts))
+}
+
+# bootstrapping with 1000 replicates
+gem.pathways.boot = boot(gem.dat.nozero.fixed, statistic = pathway_func, R=1000)
+summary(gem.pathways.boot)
+
+# function to estimate bootstrapped 95% conf intervals
+ci_func = function(boot_obj) {
+  ci_df = data.frame()
+  for (ind in 1:ncol(boot_obj$t)) {
+    ci = boot.ci(boot_obj, type = "norm", t0 = boot_obj$t0[ind], t = boot_obj$t[,ind])
+    ci_df[ind,1] = ci$normal[1,2]
+    ci_df[ind,2] = ci$normal[1,3]
+  }
+  return(ci_df)
+}
+
+# estimate 95% conf intervals for the bootstrapped object
+gem.pathways.boot.ci = ci_func(gem.pathways.boot)
+colnames(gem.pathways.boot.ci) = c("low", "high") 
+rownames(gem.pathways.boot.ci) = c("AminoAcids", "Ammonium", "BNF", "Chitinase", "Chitinase2", "Cyanase", "NO2assim_fd", "NO2assim_NADH", "NO3assim", "Urea")
+
+# add bootstrap median values to the df
+gem.pathways.boot.ci$bootMed = summary(gem.pathways.boot)$bootMed
+gem.pathways.boot.ci$pathway = rownames(gem.pathways.boot.ci)
+
+# plot, indicate conf intervals via error bars
+gem.pathways.boot.ci %>%
+  ggplot(aes(x= fct_rev(fct_reorder(pathway, bootMed)), y=bootMed)) +
+  geom_col() +
+  geom_errorbar(aes(ymin=low, ymax=high), width = 0.3, position = position_dodge(0.9)) +
+  xlab("Pathway") +
+  scale_x_discrete(labels = c("Amino acids", "Ammonium", "HexNAc", "Nitrite (Fd)", "Chitin", "Urea", "Nitrate", "Nitrite (NADH)", "Cyanate", "BNF")) +
+  ylab("Genome counts") +
+  annotate("text", label = "1000 booststrap replicates", x=8, y=8000) +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5),
+        axis.text = element_text(color="black"))
+```
+
+### Figure 1b
+```{r}
+# convert AAs to binary presence-absence
+gem.dat.nozero.fixed = gem.dat.nozero.fixed %>%
+  mutate("AGCS" = case_when(agcs>0 ~1, TRUE ~0),
+         "APC" = case_when(apc>0 ~1, TRUE ~0),
+         "HAAAP" = case_when(haaap>0 ~1, TRUE ~0),
+         "LIVCS" = case_when(livcs>0 ~1, TRUE ~0),
+         "BCCT" = case_when(bcct>0 ~1, TRUE ~0),
+          )
+
+# function for boostrapping the data, returning a vecotr of genom_counts for each pathway
+pathway_func1 = function(data, ind) {
+  data.ind = data[ind,]
+  counts.df = data.ind %>%
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AGCS, APC, HAAAP, LIVCS, BCCT)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>%
+  group_by(pathway) %>%
+  summarize(genome_counts = sum(counts))
+  return(as.vector(counts.df$genome_counts))
+}
+
+# bootstrapping with 1000 replicates
+gem.pathways.boot1 = boot(gem.dat.nozero.fixed, statistic = pathway_func1, R=1000)
+summary(gem.pathways.boot1)
+
+# estimate 95% conf intervals for the bootstrapped object
+# FUNCTION defined elsewhere
+gem.pathways.boot.ci.1 = ci_func(gem.pathways.boot1)
+colnames(gem.pathways.boot.ci.1) = c("low", "high") 
+rownames(gem.pathways.boot.ci.1) = c("AGCS", "Ammonium", "APC", "BCCT", "BNF", "Chitinase", "Chitinase2", "Cyanase", "HAAAP", "LIVCS", "NO2assim_fd", "NO2assim_NADH", "NO3assim", "Urea")
+
+# add bootstrap median values to the df
+gem.pathways.boot.ci.1$bootMed = summary(gem.pathways.boot1)$bootMed
+gem.pathways.boot.ci.1$pathway = rownames(gem.pathways.boot.ci.1)
+
+# plot, indicate conf intervals via error bars
+gem.pathways.boot.ci.1 %>%
+  ggplot(aes(x= fct_rev(fct_reorder(pathway, bootMed)), y=bootMed)) +
+  geom_col() +
+  geom_errorbar(aes(ymin=low, ymax=high), width = 0.3, position = position_dodge(0.9)) +
+  xlab("Pathway") +
+  scale_x_discrete(labels = c("APC", "Ammonium", "AGCS", "HexNAc", "LIVCS", "Nitrite (Fd)", "BCCT", "Chitin", "Urea", "Nitrate", "Nitrite (NADH)", "HAAAP", "Cyanate", "BNF")) +
+  ylab("Genome counts") +
+  annotate("text", label = "1000 booststrap replicates", x=9, y=6000) +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5),
+        axis.text = element_text(color="black"))
+
+```
+
+### Figure S1; subsample to reduce taxonomic biases
+```{r}
+# filter to df to include families with at least 10, 50, 100, and 200 genomes each.
+# iterate over c(10,50,100,200) below to generate Fig. S1
+
+# example provided for "at least 200 genomes per family"
+low.count.taxa = gem.dat.nozero.fixed %>%
+  group_by(Family) %>%
+  summarise(count=n()) %>%
+  filter(count < 200) %>%
+  select(Family)
+
+gem.dat.nozero.fixed.ed = gem.dat.nozero.fixed %>%
+  filter(!Family %in% low.count.taxa$Family)
+
+gem.dat.nozero.fixed.ed %>%
+  group_by(Family) %>%
+  slice_sample(n=200, replace=FALSE) %>%
+  ungroup() %>%
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>%
+  group_by(pathway) %>%
+  summarize(genome_counts = sum(counts)) %>%
+  ggplot(aes(x= fct_rev(fct_reorder(pathway, genome_counts)), y=genome_counts)) +
+  geom_col() +
+  xlab("Pathway") +
+  scale_x_discrete(labels = c("Amino acids", "Ammonium", "HexNAc", "Nitrite (Fd)", "Chitin", "Urea", "Nitrate", "Nitrite (NADH)", "Cyanate", "BNF")) +
+  ylab("Genome counts") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5),
+        axis.text = element_text(color="black")) +
+  ggtitle("At least 200 genomes per Family")
+
+```
+
+--- Metabolic traits versus N pathway distributions; Figures 3b, 3c
+
+##### Create new df with metabolic annotations
+```{r}
+gems.metab = read.table("GEMs_Metabolisms.txt", header=TRUE, sep ="\t")\
+dim(gems.metab) #4826
+
+# merge with the df from above
+gem.dat.nozero.metab = merge(gems.metab[,c(1,12:14)], gem.dat.nozero.fixed, )
+dim(gem.dat.nozero.metab) #4749
+```
+
+### Figure 3b
+```{r}
+# filter to include 6 selected clades for comparison with Fig. 2a
+gem.dat.nozero.metab.sel = gem.dat.nozero.metab %>% 
+  filter(Class == "c__Cyanobacteriia" | Order %in% c("o__Rhizobiales", "o__Desulfovibrionales", "o__Methanococcales", "o__Methanobacterales", "o__Clostridiales"))
+
+gem.dat.nozero.metab.sel %>%
+  arrange(TrophicMode) %>%
+  ggplot(aes(x=Energy_respiration, y=N_pathways))  +
+  geom_jitter(aes(color = Class, size=genome_length), alpha = 8, position = position_jitter(width = 0.3, height = 0.2)) +
+  scale_size(range = c(0.01,6)) +
+  facet_grid(~TrophicMode, scales = "free_x") +
+  scale_color_manual(values= c("#1F6683", "#DD3C51", "#A1B654", "#A092B7")) +
+  geom_boxplot(alpha = 0.1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  scale_y_continuous(limits = c(0, 9), breaks = seq(0, 9, 2)) +
+  theme_bw() +
+  xlab("") +
+  ylab("Number of N strategies")
+```
+
+### Figure 3c
+```{r}
+gem.dat.nozero.metab$TrophicMode = factor(gem.dat.nozero.metab$TrophicMode, levels = c("Chemoorganotroph", "Chemoautotroph", "Mixotroph", "Photoautotroph", "Photoorganotroph"))
+
+gem.dat.nozero.metab %>%
+  arrange(TrophicMode) %>%
+  ggplot(aes(x=Energy_respiration, y=N_pathways))  +
+  geom_jitter(aes(color = TrophicMode, size=genome_length), alpha = 0.7, position = position_jitter(width = 0.2, height = 0.1)) +
+  scale_size(range = c(0.01,6)) +
+  facet_grid(~TrophicMode) +
+  scale_color_manual(values= c( "#A092B7","#1F6683","#DD3C51","#A1B654", "#CD8862")) +
+  geom_boxplot(alpha = 0.1, color="black") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  scale_y_continuous(limits = c(0, 9), breaks = seq(0, 9, 2)) +
+  xlab("") +
+  ylab("Number of N strategies")
+```
+
+--- Chitinase and BNF; Figure 4
+Examine the dist of bnf and chitinase
+
+### Figure 4b
+Is a BNF positive genome more likely to be anaerobic?
+```{r}
+# function for boostrapping the data, returning a vector of genome counts for each pathway across energy modes
+bnf_func = function(data, ind) {
+  data.ind = data[ind,]
+  counts.df = data.ind %>%
+  select( c(BNF, Energy_respiration)) %>%
+  group_by(BNF, Energy_respiration) %>% summarise( n = n()) %>%
+  mutate(freq = 100 * round(n/sum(n), 2)) %>%
+    filter(BNF>0)
+  return(as.vector(counts.df$freq))
+}
+
+# bootstrapping with 1000 replicates
+gem.bnf.boot = boot(gem.dat.nozero.metab, statistic = bnf_func, R=1000)
+summary(gem.bnf.boot)
+
+# function to estimate bootstrapped 95% conf intervals defined elsewhere
+# estimate 95% conf intervals for the bootstrapped object
+gem.bnf.boot.ci = ci_func(gem.bnf.boot)
+colnames(gem.bnf.boot.ci) = c("low", "high") 
+rownames(gem.bnf.boot.ci) = c("Aerobic", "Anaerobic", "Facultative anaerobe")
+
+# add bootstrap median values to the df
+gem.bnf.boot.ci$bootMed = summary(gem.bnf.boot)$bootMed
+gem.bnf.boot.ci$pathway = rownames(gem.bnf.boot.ci)
+
+gem.bnf.boot.ci$pathway = factor(gem.bnf.boot.ci$pathway, levels =c("Aerobic", "Facultative anaerobe", "Anaerobic"))
+
+# plot, indicate conf intervals via error bars
+gem.bnf.boot.ci %>%
+  #ggplot(aes(x= fct_rev(fct_reorder(pathway, bootMed)), y=bootMed)) +
+  ggplot(aes(x= pathway, y=bootMed)) +
+  geom_col() +
+  geom_errorbar(aes(ymin=low, ymax=high), width = 0.3, position = position_dodge(0.9)) +
+  xlab("") +
+  ylab("Count of BNF-positive genomes") +
+  theme_few() +
+  theme(axis.text = element_text(color="black")) +
+  annotate("text", label = "1000 booststrap replicates", x=1.9, y=70)
+```
+
+### Figure 4a
+Is a chitinase positive genome more likely to be aerobic?
+```{r}
+# function for boostrapping the data, returning a vector of genome count proportions per energy mode for chitinase==1
+chit_func = function(data, ind) {
+  data.ind = data[ind,]
+  counts.df = data.ind %>%
+  select(Chitinase, Energy_respiration) %>%
+  group_by(Energy_respiration, Chitinase) %>% summarise( n = n()) %>% 
+  mutate(freq = 100 * round(n/sum(n), 2)) %>%
+  filter(Chitinase == 1)
+  return(as.vector(counts.df$freq))
+}
+
+# bootstrapping with 1000 replicates
+gem.chit.boot = boot(gem.dat.nozero.metab, statistic = chit_func, R=1000)
+summary(gem.chit.boot)
+
+# estimate 95% conf intervals for the bootstrapped object
+# function defined elsewhere
+gem.chit.boot.ci = ci_func(gem.chit.boot)
+colnames(gem.chit.boot.ci) = c("low", "high") 
+rownames(gem.chit.boot.ci) = c("Aerobic", "Anaerobic", "Facultative anaerobe")
+
+# add bootstrap median values to the df
+gem.chit.boot.ci$bootMed = summary(gem.chit.boot)$bootMed
+gem.chit.boot.ci$pathway = rownames(gem.chit.boot.ci)
+
+# plot, indicate conf intervals via error bars
+gem.chit.boot.ci %>%
+  ggplot(aes(x= fct_rev(fct_reorder(pathway, bootMed)), y=bootMed)) +
+  geom_col() +
+  geom_errorbar(aes(ymin=low, ymax=high), width = 0.3, position = position_dodge(0.9)) +
+  xlab("") +
+  ylab("Count of Chitinase-positive genomes") +
+  theme_few() +
+  theme(axis.text = element_text(color="black")) +
+  annotate("text", label = "1000 booststrap replicates", x=2.9, y=28)
+```
+
+
+--- Prevalence of organic and inorganic pathways; Figure 5a
+
+### Figure 5a
+```{r}
+# new variable to store number of inorganic pathways
+gem.dat.nozero = gem.dat.nozero %>% 
+  mutate(inorg_num = (rowSums(across(c("NO2assim_fd", "Ammonium", "BNF", "NO2assim_NADH", "NO3assim_compl"))))/ N_pathways)
+
+# boxplot of rel inorg counts
+gem.dat.nozero %>%
+  ggplot(aes(x=Host, y=inorg_num)) +
+  geom_boxplot() +
+  geom_violin(fill = "thistle", alpha = 0.2) +
+  theme_few() +
+  xlab("") +
+  ylab("Relative count of inorganic N strategies")
+
+# stat significance, t-test
+# check assumptions
+gem.dat.nozero %>%
+  group_by(Host) %>%
+  identify_outliers(inorg_num)
+
+# normality
+library(nortest) #shapiro_test only for 3-5000 samples. need a diff test
+nortest::ad.test(gem.dat.nozero$inorg_num)
+shapiro.test(gem.dat.nozero$inorg_num[1:5000])
+ggpubr::ggqqplot(gem.dat.nozero, x="inorg_num", facet.by = "Host")
+## failed normality test
+
+# equality of variances
+gem.dat.nozero %>% levene_test(inorg_num ~ Host)
+## suggests sign diff between variances of the two groups. if other asusmptions held, use Welch t-test.
+
+# since t-test assumptions failed, use wilcoxon test
+host.inorg = gem.dat.nozero %>% filter(Host == "host-associated") %>% select(inorg_num)
+fl.inorg = gem.dat.nozero %>% filter(Host == "free-living") %>% select(inorg_num)
+
+fl.inorg$inorg_num
+
+wilcox.test(fl.inorg$inorg_num, host.inorg$inorg_num, paired = FALSE)
+# W = 13269720, p-value < 2.2e-16
+# alternative hypothesis: true location shift is not equal to 0
+```
+
+
+
+
+
+
+
+
+
+--- Look for environmental controls; Figure 5b
+
+Add succint habitat codes
+```{r}
+gem.dat.nozero.fixed = gem.dat.nozero.fixed %>%
+  mutate(habitat_code_short = case_when(
+    habitat_code %in% c("Algae", "Annelida", "Arthropoda", "Cnidaria", "Fungi", "Mollusca", "Porifera", "Tunicates") ~ "Non-human host",
+    habitat_code %in% c("Aerobic bioreactor", "Anaerobic bioreactor", "Bioreactor") ~ "Bioreactor",
+    habitat_code %in% c("Freshwater", "Freshwater lentic") ~ "Freshwater",
+    habitat_code %in% c("Marine", "Marine mat", "Marine sediment", "Marine subsurface", "Marine wetland") ~ "Marine",
+    habitat_code %in% c("Plant endosphere", "Plant-associated", "Plant-litter") ~ "Plant-nonRhizosphere",
+    habitat_code %in% c("Solid waste", "Wastewater", "Landfill") ~ "Waste",
+    habitat_code %in% c("Freshwater", "Freshwater sediment") ~ "Freshwater",
+    habitat_code %in% c("Acid mine drainage ", "Mine pit pond") ~ "Mining-associated",
+    habitat_code %in% c("Groundwater", "Well water") ~ "Groundwater/Well water",
+    habitat_code %in% c("Polar desert", "Polar desert sand") ~ "Polar desert",
+    habitat_code %in% c("Hydrothermal", "Thermal springs") ~ "Marine/non-marine hydrothermal",
+    habitat_code %in% c("Bog", "Fen", "Peatland", "Wetland") ~ "Peatland/Wetland",
+    ecosystem_category == "Bioremediation" ~ "Bioremediation",
+    ecosystem_category == "Human" ~ "Human host",
+    (habitat_code %in% c("Digestive system", "Reproductive system", "Skin") & ecosystem_category != "Human") ~ "Non-human host",
+    TRUE ~ habitat_code
+    ))
+
+```
+
+PCA using prcomp; Fig. 5b
+### Fig. 5b
+
+```{r}
+# select ecosystem categories for comparison
+env.sel = c("Bioreactor", "Host-associated", "Terrestrial", "Built environment", "Waste/composting", "Plants", "Freshwater", "Marine", "Non-marine saline", "Alkaline", "Soil", "Thermal springs" )
+
+# filter df to include the selected env categories
+gem.dat.nozero.sel.env = gem.dat.nozero.fixed %>%
+  filter(ecosystem_broad %in% env.sel)
+dim(gem.dat.nozero.sel.env) #8605
+
+# prepare df for PCA
+gem.dat.nozero.sel.env.mat = gem.dat.nozero.sel.env %>% 
+  select(Ammonium, NO2assim_fd, Urea, Cyanate, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)
+
+# compute PCA
+pca.sel.env = prcomp(gem.dat.nozero.sel.env.mat, scale=TRUE)
+screeplot(pca.sel.env)
+summary(pca.sel.env)
+
+# plot using ggplot
+scores.sel.env = data.frame(Genomes = gem.dat.nozero.sel.env$genome_id, pca.sel.env$x)
+loadings.sel.env = data.frame(vars = rownames(pca.sel.env$rotation), pca.sel.env$rotation)
+# variable to color points by:
+pca.col.sel.env = as.factor(gem.dat.nozero.sel.env$ecosystem_broad)
+pca.col.sel.env2 = as.factor(gem.dat.nozero.sel.env$habitat_code_short)
+pca.shape.sel = as.factor(gem.dat.nozero.sel.env$Host)
+
+# plot PCA:
+ggplot(scores.sel.env, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color = pca.col.sel.env2), size=3) +
+  scale_color_manual(values = colorRampPalette(brewer.pal(11, "Paired"))(23)) +
+  geom_segment(data = loadings.sel.env, aes(x=0, y=0, xend=(PC1*4), yend=(PC2*4)), arrow = arrow(length = unit(1/2, "picas")), color = "black") +
+  annotate("text", x = (loadings.sel.env$PC1*5), y= (loadings.sel.env$PC2*5), label=loadings.sel.env$vars) +
+  scale_size(range = c(0.2,4)) +
+  theme_few() +
+  coord_fixed(ratio = 0.13/0.30) +
+  xlab("PC1 (29.7%)") +
+  ylab("PC2, (13.0%)") +
+  theme(axis.text = element_text(color="black"))
+```
+
+PCA using logisticPCA
+```{r}
+library(logisticPCA)
+### logistic pca
+# determine cross-validation m; assume k=2 and try m= 1 through 10
+# logpca.env.cv = cv.lpca(gem.dat.nozero.sel.env.mat, ks=2, ms = 1:10)
+logpca.env.cv = cv.lpca(gem.dat.nozero.sel.env.mat, ks=2, ms = 1:20)
+which.min(logpca.env.cv)  #10
+# logistic pca
+logpca.env.model = logisticPCA(gem.dat.nozero.sel.env.mat, k=2, m=which.min(logpca.env.cv))
+logpca.env.model # 62.9% of deviance explained, 147 iterations to converge
+print(logpca.env.model)
+
+plot(logpca.env.model, type = "scores") + geom_point(aes(color = pca.col.sel.env2), size=3)
+
+# plot using ggplot
+scores.log.env = data.frame(Genomes = gem.dat.nozero.sel.env$genome_id, logpca.env.model$PCs)
+
+loadings.log.env = data.frame(vars = colnames(gem.dat.nozero.sel.env.mat), logpca.env.model$U)
+
+ggplot(scores.log.env, aes(x=X1, y=X2, drop=TRUE)) +
+  geom_point(aes(color = pca.col.sel.env2, shape=pca.shape.sel), size=3) +
+  scale_color_manual(values = colorRampPalette(brewer.pal(11, "Paired"))(23)) +
+  geom_segment(data = loadings.log.env, aes(x=0, y=0, xend=(X1*20), yend=(X2*20)), arrow = arrow(length = unit(1/2, "picas")), color = "black") +
+  annotate("text", x = (loadings.log.env$X1*20.2), y= (loadings.log.env$X2*20.2), label=loadings.log.env$vars) +
+  theme_few() +
+  xlab("PC1") +
+  ylab("PC2") +
+  theme(axis.text = element_text(color="black")) 
+```
+
+
+
+
+
+
+---- proportion of genomes with chitinase per habitat type
+### Fig. S3
+```{r}
+# chitinase count by habitat
+gem.dat.nozero.sel.env %>%
+  group_by(habitat_code_short) %>% summarise(sum = sum(Chitinase),
+                                       genome_sum = n()) %>%
+  mutate(norm = sum/genome_sum) %>%
+  droplevels() %>%
+  ggplot(aes(x=fct_rev(fct_reorder(habitat_code_short, norm)), y=norm)) +
+  geom_col() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  xlab("") +
+  ylab("Fraction of genomes with Chitinases")
+```
+
+
+
+--- hypothesis testing: 
+Higher cost pathways and trophic/energy mode
+```{r}
+library(lme4)
+gem.metab.highcost = gem.dat.nozero.metab %>%
+  filter(BNF > 0 | Chitinase > 0 )
+
+# logistic regression
+gem.highcost.glm = gem.metab.highcost %>% as.data.frame() %>%
+  glm(BNF ~ Energy_respiration, data = ., family = "poisson")
+
+summary(gem.highcost.glm)
+
+# mixed effects logistic regression
+# control for taxonomic relatedness for chitinase occurrence
+
+gem.highcost.glmm = gem.metab.highcost %>% 
+  filter(Family != "f__") %>%
+  as.data.frame() %>%
+  glmer(Chitinase ~ Energy_respiration + (1|Family), data = ., family = "binomial")
+  
+summary(gem.highcost.glmm)
+
+car::Anova(gem.highcost.glmm, test="Chisq")
+
+```
+
+
+
+Hypothesis testing; prevalence all
+```{r}
+# significance test
+library(multcompView)
+library(rcompanion)
+
+gem.prev = gem.dat.nozero.fixed %>% 
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>% 
+  group_by(pathway)
+
+# kruskal test
+kruskal.test(counts ~ pathway, data = gem.prev)
+# Kruskal-Wallis chi-squared = 32402, df = 9, p-value < 2.2e-16
+
+gem.prev.pt = pairwise.wilcox.test(gem.prev$counts, gem.prev$pathway, paired=TRUE, p.adjust.method="fdr")
+
+gem.prev.pval = fullPTable(gem.prev.pt$p.value)
+
+all.siglett = multcompView::multcompLetters(gem.prev.pval, compare="<", threshold=0.05,Letters=letters)
+all.siglett
+
+#  AA  amtB  bnf chit chit2 cyanate no2_fd no2_nadh no3Comp  urea
+#  "a" "b"   "c"  "d"  "e"   "f"    "g"      "h"      "i"   "i"
+```
+
+Hypothesis testing; prevalence host-associated
+```{r}
+gem.host.prev = gem.dat.nozero.fixed %>% 
+  filter(Host == "host-associated") %>%
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>% 
+  group_by(pathway)
+
+# kruskal test
+kruskal.test(counts ~ pathway, data = gem.host.prev)
+# Kruskal-Wallis chi-squared = 19387, df = 9, p-value < 2.2e-16
+
+gem.host.prev.pt = pairwise.wilcox.test(gem.host.prev$counts, gem.host.prev$pathway, paired=TRUE, p.adjust.method="fdr")
+
+gem.host.prev.pval = fullPTable(gem.host.prev.pt$p.value)
+
+multcompView::multcompLetters(gem.host.prev.pval, compare="<", threshold=0.05,Letters=letters)
+
+#  AA.  AmtB  bnf chit chit2 cyanate no2_fd no2_nadh no3Comp  urea
+#  "a"   "b"  "c"  "d"   "e"     "f"     "g"    "h"   "h"   "i"
+```
+
+Hypothesis testing; prevalence FL
+```{r}
+gem.fl.prev = gem.dat.nozero %>% 
+  filter(Host == "free-living") %>%
+  select( c(NO2assim_fd, Urea, Cyanate, Ammonium, Chitinase, Chitinase2, BNF, NO2assim_NADH, NO3assim_compl, AminoAcids)) %>%
+  pivot_longer(cols = everything(), names_to = c("pathway"), values_to = c("counts")) %>% 
+  group_by(pathway)
+
+# kruskal test
+kruskal.test(counts ~ pathway, data = gem.fl.prev)
+# Kruskal-Wallis chi-squared = 15398, df = 9, p-value < 2.2e-16
+
+gem.fl.prev.pt = pairwise.wilcox.test(gem.fl.prev$counts, gem.fl.prev$pathway, paired=TRUE, p.adjust.method="fdr")
+
+gem.fl.prev.pval = fullPTable(gem.fl.prev.pt$p.value)
+
+multcompView::multcompLetters(gem.fl.prev.pval, compare="<", threshold=0.05,Letters=letters)
+
+#  AA.  AmtB  bnf chit chit2 cyanate   no2_fd   no2_nadh no3Comp  urea
+#  "a"   "b"  "c"  "d"   "ef"     "g"     "h"    "de"   "f"   "de"
+```
+
+
+
